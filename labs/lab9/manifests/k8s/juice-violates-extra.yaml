@@ -1,0 +1,38 @@
+# Written to violate labs/lab9/policies/extra/hardening.rego while passing every
+# shipped k8s.security rule: the main container is fully hardened, but
+#  - its image is pinned by tag (v20.0.0), not by digest  -> deny
+#  - an initContainer runs with no securityContext at all -> warn (and deny: tag)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: juice-violates-extra
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: juice }
+  template:
+    metadata:
+      labels: { app: juice }
+    spec:
+      initContainers:
+        - name: fetch-config
+          image: alpine:3.20
+          command: ["sh", "-c", "wget -qO /work/config.json http://config.internal/juice.json"]
+      containers:
+        - name: juice
+          image: bkimminich/juice-shop:v20.0.0
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }
+          livenessProbe:
+            httpGet: { path: /, port: 3000 }

@@ -1,0 +1,71 @@
+# Lab 9 custom Falco rules. Loaded from /etc/falco/rules.d/ (mounted read-only).
+# Reload after editing: docker kill --signal=SIGHUP falco
+
+# 9.3 Container drift: a file written under /tmp inside a container.
+# The image is supposed to be immutable; /tmp is where droppers, downloaded
+# payloads and scratch tooling usually land first.
+- rule: Write below tmp in container
+  desc: >
+    A process inside a container (not on the host) opened a regular file under
+    /tmp for writing. Signals runtime drift from the image: staged payloads,
+    downloaded tools or scripts written before execution.
+  condition: >
+    open_write
+    and container
+    and fd.name startswith /tmp/
+  output: >
+    File opened for writing under /tmp in a container
+    (container=%container.name image=%container.image.repository:%container.image.tag
+    user=%user.name uid=%user.uid file=%fd.name command=%proc.cmdline
+    parent=%proc.pname container_id=%container.id)
+  priority: WARNING
+  tags: [container, drift]
+
+# Bonus: likely cryptomining. Two signals must coincide:
+#   1. a connect() from a container to a port mining pools commonly listen on, and
+#   2. the process making it is a known miner, a raw socket tool, or speaks stratum.
+# The shipped `outbound` macro is not reused on purpose: it drops 127.0.0.0/8 and
+# failed connects, and a refused connect is already proof of intent.
+#
+# Falco 0.43 drops syscall enter events. For a connect() that fails (ECONNREFUSED)
+# the socket never gets a tuple, so fd.sport / fd.name are empty (<NA>, 0.0.0.0:0);
+# the destination survives only in the exit event's own argument, evt.arg.addr.
+# The port check therefore looks at both.
+- list: miner_pool_ports
+  items: [3333, 4444, 5555, 7777, 14444]
+
+- macro: connect_to_pool_port
+  condition: >
+    (fd.sport in (miner_pool_ports)
+     or evt.arg.addr endswith ":3333"
+     or evt.arg.addr endswith ":4444"
+     or evt.arg.addr endswith ":5555"
+     or evt.arg.addr endswith ":7777"
+     or evt.arg.addr endswith ":14444")
+
+- list: miner_process_names
+  items: [xmrig, xmr-stak, minerd, cpuminer, cgminer, bfgminer, ethminer, nbminer, lolminer, ccminer, t-rex]
+
+- list: raw_socket_tools
+  items: [nc, ncat, netcat, socat]
+
+- rule: Possible cryptominer pool connection
+  desc: >
+    A process in a container attempted a TCP/UDP connection to a typical mining-pool
+    port, and the process is a known miner binary, a raw socket tool, or uses a
+    stratum URL. Either signal alone is noisy; together they are worth waking up for.
+  condition: >
+    evt.type = connect
+    and container
+    and (fd.typechar = 4 or fd.typechar = 6)
+    and connect_to_pool_port
+    and (proc.name in (miner_process_names)
+         or proc.name in (raw_socket_tools)
+         or proc.cmdline contains "stratum+tcp")
+  output: >
+    Possible cryptominer connecting to a pool port
+    (container=%container.name container_id=%container.id image=%container.image.repository:%container.image.tag
+    process=%proc.name exe=%proc.exepath command=%proc.cmdline user=%user.name
+    destination=%evt.arg.addr connection=%fd.name result=%evt.res)
+  priority: CRITICAL
+  tags: [container, network, mitre_command_and_control, mitre_impact, T1496]
